@@ -1,0 +1,14 @@
+# Virtualenv - 7.5GB of torch/CUDA wheels, rebuild with:
+#   uv venv --python 3.12
+#   uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+#   uv pip install whisperx
+.venv/
+
+__pycache__/
+*.py[cod]
+
+# Audio and transcripts live in the Obsidian vault, never here
+*.wav
+*.mp3
+*.m4a
+*.flac

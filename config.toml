@@ -1,0 +1,21 @@
+[paths]
+vault        = "/home/gregory-milligan/Obsidian/Karpathy-Wiki"
+inbox        = "Inbox"           # structured notes land here
+transcripts  = "Transcripts"     # raw diarized transcripts
+audio_archive = "Audio-Archive"  # originals moved here after processing
+
+[whisper]
+model        = "large-v3"
+compute_type = "float16"
+batch_size   = 16                # 5090/32GB handles this comfortably
+language     = "en"              # set to "" for auto-detect
+diarize      = false             # true requires HF_TOKEN + pyannote licence acceptance
+
+[llm]
+host         = "http://localhost:11434"
+model        = "qwen3.6:35b-a3b"
+# transcripts longer than this are map-reduced instead of sent whole
+chunk_chars  = 24000
+temperature  = 0.2
+think        = false             # qwen3.6 is a reasoning model; off is much faster
+                                 # for extraction. Set true if quality disappoints.
