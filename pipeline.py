@@ -4,6 +4,7 @@
 Usage:
     python pipeline.py recording.wav [more.wav ...]
     python pipeline.py --no-llm recording.wav     # transcript only
+    python pipeline.py --force recording.wav      # overwrite existing vault files
 """
 import argparse
 import datetime as dt
@@ -31,6 +32,41 @@ def slugify(text, limit=60):
 
 def hhmmss(seconds):
     return str(dt.timedelta(seconds=int(seconds)))
+
+
+def yaml_scalar(value):
+    """Double-quoted YAML scalar safe for frontmatter injection."""
+    s = str(value)
+    escaped = (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
+def unique_path(path: Path) -> Path:
+    """Return path, or path-2 / path-3 / ... if it already exists."""
+    if not path.exists():
+        return path
+    stem, suffix, parent = path.stem, path.suffix, path.parent
+    n = 2
+    while True:
+        candidate = parent / f"{stem}-{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def require_fresh(path: Path, force: bool) -> Path:
+    """Refuse to clobber existing vault files unless force is set."""
+    if path.exists() and not force:
+        raise FileExistsError(
+            f"{path.relative_to(VAULT)} already exists "
+            f"(pass --force to overwrite)"
+        )
+    return path
 
 
 # --------------------------------------------------------------------------- ASR
@@ -75,17 +111,19 @@ def transcribe(audio_path, diarize=False):
 
 
 def transcript_markdown(asr):
-    """Speaker-grouped, timestamped plain text."""
-    lines, current, buf, start = [], None, [], 0.0
+    """Speaker-grouped, timestamped plain text.
+
+    Emits one paragraph per ASR segment so map/reduce can chunk long
+    non-diarized transcripts (all segments share the SPEAKER label).
+    Consecutive same-speaker segments still keep their own timestamps.
+    """
+    lines = []
     for seg in asr["segments"]:
         spk = seg.get("speaker", "SPEAKER")
-        if spk != current:
-            if buf:
-                lines.append(f"**[{hhmmss(start)}] {current}:** {' '.join(buf).strip()}")
-            current, buf, start = spk, [], seg["start"]
-        buf.append(seg["text"].strip())
-    if buf:
-        lines.append(f"**[{hhmmss(start)}] {current}:** {' '.join(buf).strip()}")
+        text = seg["text"].strip()
+        if not text:
+            continue
+        lines.append(f"**[{hhmmss(seg['start'])}] {spk}:** {text}")
     return "\n\n".join(lines)
 
 
@@ -150,32 +188,72 @@ combine action items, and keep the strongest quotes. Do not invent anything.
 {body}"""
 
 
+def fill_body(template, body):
+    """Insert body without str.format so braces in the transcript are safe."""
+    return template.replace("{body}", body)
+
+
+def _hard_split(text, limit):
+    """Split text into pieces of at most `limit` characters, preferring newlines."""
+    if len(text) <= limit:
+        return [text] if text else []
+    pieces = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            pieces.append(rest)
+            break
+        cut = rest.rfind("\n", 0, limit + 1)
+        if cut < limit // 2:
+            cut = rest.rfind(" ", 0, limit + 1)
+        if cut < limit // 2:
+            cut = limit
+        pieces.append(rest[:cut])
+        rest = rest[cut:].lstrip("\n")
+        if rest.startswith(" "):
+            rest = rest.lstrip(" ")
+    return pieces
+
+
+def chunk_text(text, limit):
+    """Pack paragraphs into chunks of at most `limit` chars; hard-split oversize ones."""
+    if len(text) <= limit:
+        return [text]
+
+    paras = text.split("\n\n")
+    chunks, cur = [], ""
+    for p in paras:
+        parts = _hard_split(p, limit) if len(p) > limit else [p]
+        for part in parts:
+            # room for separator if cur is non-empty
+            sep = "\n\n" if cur else ""
+            if cur and len(cur) + len(sep) + len(part) > limit:
+                chunks.append(cur)
+                cur = part
+            else:
+                cur = cur + sep + part if cur else part
+    if cur.strip():
+        chunks.append(cur)
+    return chunks
+
+
 def structure(transcript):
     limit = CFG["llm"]["chunk_chars"]
     if len(transcript) <= limit:
-        return ollama(STRUCTURE_PROMPT.format(body=transcript), SYSTEM)
+        return ollama(fill_body(STRUCTURE_PROMPT, transcript), SYSTEM)
 
-    paras = transcript.split("\n\n")
-    chunks, cur = [], ""
-    for p in paras:
-        if len(cur) + len(p) > limit and cur:
-            chunks.append(cur)
-            cur = ""
-        cur += p + "\n\n"
-    if cur.strip():
-        chunks.append(cur)
-
+    chunks = chunk_text(transcript, limit)
     print(f"  long transcript - map/reduce over {len(chunks)} chunks", flush=True)
     partials = []
     for i, c in enumerate(chunks, 1):
         print(f"    chunk {i}/{len(chunks)}", flush=True)
-        partials.append(ollama(STRUCTURE_PROMPT.format(body=c), SYSTEM))
-    return ollama(REDUCE_PROMPT.format(body="\n\n---\n\n".join(partials)), SYSTEM)
+        partials.append(ollama(fill_body(STRUCTURE_PROMPT, c), SYSTEM))
+    return ollama(fill_body(REDUCE_PROMPT, "\n\n---\n\n".join(partials)), SYSTEM)
 
 
 # --------------------------------------------------------------------------- main
 
-def process(audio_path, use_llm=True, diarize=False):
+def process(audio_path, use_llm=True, diarize=False, force=False):
     audio_path = Path(audio_path)
     print(f"\n=> {audio_path.name}")
     asr = transcribe(audio_path, diarize=diarize)
@@ -189,10 +267,11 @@ def process(audio_path, use_llm=True, diarize=False):
     for d in (INBOX, TRANSCRIPTS, ARCHIVE):
         d.mkdir(parents=True, exist_ok=True)
 
-    tpath = TRANSCRIPTS / f"{slug}-transcript.md"
+    tpath = require_fresh(TRANSCRIPTS / f"{slug}-transcript.md", force)
     tpath.write_text(
-        f"---\ntitle: {title} (transcript)\ndate: {date}\n"
-        f"duration: {hhmmss(asr['duration'])}\nlanguage: {asr['language']}\n"
+        f"---\ntitle: {yaml_scalar(title + ' (transcript)')}\ndate: {yaml_scalar(date)}\n"
+        f"duration: {yaml_scalar(hhmmss(asr['duration']))}\n"
+        f"language: {yaml_scalar(asr['language'])}\n"
         f"source: plaud\ntype: transcript\n---\n\n{body}\n"
     )
     print(f"  transcript -> {tpath.relative_to(VAULT)}")
@@ -200,17 +279,18 @@ def process(audio_path, use_llm=True, diarize=False):
     if use_llm:
         print("  structuring via ollama ...", flush=True)
         note = structure(body)
-        npath = INBOX / f"{slug}.md"
+        npath = require_fresh(INBOX / f"{slug}.md", force)
         npath.write_text(
-            f"---\ntitle: {title}\ndate: {date}\n"
-            f"duration: {hhmmss(asr['duration'])}\nsource: plaud\n"
+            f"---\ntitle: {yaml_scalar(title)}\ndate: {yaml_scalar(date)}\n"
+            f"duration: {yaml_scalar(hhmmss(asr['duration']))}\nsource: plaud\n"
             f"type: recording-note\nstatus: unreviewed\n"
-            f"transcript: \"[[{tpath.stem}]]\"\n---\n\n"
+            f"transcript: {yaml_scalar('[[' + tpath.stem + ']]')}\n---\n\n"
             f"# {title}\n\n{note}\n\n---\nFull transcript: [[{tpath.stem}]]\n"
         )
         print(f"  note       -> {npath.relative_to(VAULT)}")
 
-    dest = ARCHIVE / audio_path.name
+    # Date-prefix archive names so same basenames from different folders don't collide.
+    dest = unique_path(ARCHIVE / f"{date}-{audio_path.name}")
     if audio_path.resolve() != dest.resolve():
         shutil.copy2(audio_path, dest)
         print(f"  audio      -> {dest.relative_to(VAULT)}")
@@ -221,13 +301,17 @@ def main():
     ap.add_argument("audio", nargs="+")
     ap.add_argument("--no-llm", action="store_true", help="transcript only")
     ap.add_argument("--diarize", action="store_true", help="speaker labels (needs HF_TOKEN)")
+    ap.add_argument(
+        "--force", action="store_true",
+        help="overwrite existing vault notes/transcripts",
+    )
     args = ap.parse_args()
 
     diarize = args.diarize or CFG["whisper"]["diarize"]
     failed = 0
     for a in args.audio:
         try:
-            process(a, use_llm=not args.no_llm, diarize=diarize)
+            process(a, use_llm=not args.no_llm, diarize=diarize, force=args.force)
         except Exception as e:
             failed += 1
             print(f"  ! FAILED {a}: {e}", file=sys.stderr)

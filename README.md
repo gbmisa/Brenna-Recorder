@@ -19,6 +19,9 @@ cd ~/"AI projects/Brenna Recorder"
 # transcript only, skip the LLM pass
 .venv/bin/python pipeline.py --no-llm recording.wav
 
+# overwrite existing vault notes/transcripts (default is refuse)
+.venv/bin/python pipeline.py --force recording.wav
+
 # with speaker labels (needs HF_TOKEN, see below)
 HF_TOKEN=hf_xxx .venv/bin/python pipeline.py --diarize recording.wav
 ```

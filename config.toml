@@ -2,7 +2,7 @@
 vault        = "/home/gregory-milligan/Obsidian/Karpathy-Wiki"
 inbox        = "Inbox"           # structured notes land here
 transcripts  = "Transcripts"     # raw diarized transcripts
-audio_archive = "Audio-Archive"  # originals moved here after processing
+audio_archive = "Audio-Archive"  # originals copied here after processing
 
 [whisper]
 model        = "large-v3"
