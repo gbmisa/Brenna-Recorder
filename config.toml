@@ -10,6 +10,9 @@ compute_type = "float16"
 batch_size   = 16                # 5090/32GB handles this comfortably
 language     = "en"              # set to "" for auto-detect
 diarize      = false             # true requires HF_TOKEN + pyannote licence acceptance
+paragraph_chars = 1000           # transcript paragraph size. Lower = choppier but
+                                 # easier to skim; must stay well under chunk_chars
+                                 # so long transcripts still have split points.
 
 [llm]
 host         = "http://localhost:11434"

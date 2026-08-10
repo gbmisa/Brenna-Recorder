@@ -110,21 +110,35 @@ def transcribe(audio_path, diarize=False):
     return {"segments": result["segments"], "language": lang, "duration": duration}
 
 
-def transcript_markdown(asr):
-    """Speaker-grouped, timestamped plain text.
+def transcript_markdown(asr, para_chars=None):
+    """Speaker-grouped, timestamped prose.
 
-    Emits one paragraph per ASR segment so map/reduce can chunk long
-    non-diarized transcripts (all segments share the SPEAKER label).
-    Consecutive same-speaker segments still keep their own timestamps.
+    Consecutive segments from one speaker merge into a readable paragraph, but a
+    new paragraph starts once the block exceeds `para_chars`. Both halves matter:
+    merging keeps the transcript readable for a human, while the size cap
+    guarantees paragraph breaks for chunk_text() to split on. Without the cap, a
+    non-diarized transcript (every segment labelled SPEAKER) collapses into one
+    unsplittable blob and map/reduce silently stops working.
     """
-    lines = []
+    if para_chars is None:
+        para_chars = CFG["whisper"].get("paragraph_chars", 1000)
+
+    blocks, speaker, buf, start, size = [], None, [], 0.0, 0
     for seg in asr["segments"]:
-        spk = seg.get("speaker", "SPEAKER")
         text = seg["text"].strip()
         if not text:
             continue
-        lines.append(f"**[{hhmmss(seg['start'])}] {spk}:** {text}")
-    return "\n\n".join(lines)
+        spk = seg.get("speaker", "SPEAKER")
+        if buf and (spk != speaker or size + len(text) > para_chars):
+            blocks.append(f"**[{hhmmss(start)}] {speaker}:** {' '.join(buf)}")
+            buf, size = [], 0
+        if not buf:
+            speaker, start = spk, seg["start"]
+        buf.append(text)
+        size += len(text) + 1
+    if buf:
+        blocks.append(f"**[{hhmmss(start)}] {speaker}:** {' '.join(buf)}")
+    return "\n\n".join(blocks)
 
 
 # --------------------------------------------------------------------------- LLM
