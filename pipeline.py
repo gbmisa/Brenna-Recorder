@@ -7,12 +7,17 @@ Usage:
     python pipeline.py --force recording.wav      # overwrite existing vault files
 """
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
+import os
 import re
 import shutil
 import sys
+import time
 import tomllib
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -23,6 +28,50 @@ VAULT = Path(CFG["paths"]["vault"])
 INBOX = VAULT / CFG["paths"]["inbox"]
 TRANSCRIPTS = VAULT / CFG["paths"]["transcripts"]
 ARCHIVE = VAULT / CFG["paths"]["audio_archive"]
+
+LOCK_PATH = ROOT / ".pipeline.lock"
+DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[-_ ]+")
+
+
+@contextlib.contextmanager
+def gpu_lock():
+    """Serialize pipeline.process() calls across processes.
+
+    watch.py (daemon and --once) and a direct `python pipeline.py` run can
+    all end up loading whisper/ollama onto the same GPU at once if they
+    overlap - that's a real OOM, not a hypothetical, so make concurrent runs
+    queue instead of racing.
+    """
+    with open(LOCK_PATH, "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("  waiting for another pipeline.py run to finish (GPU is shared) ...",
+                  flush=True)
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def hf_token():
+    """HF_TOKEN from the environment, falling back to a local .env file.
+
+    Non-interactive invocations (the Inbox double-click launcher, cron, etc.)
+    don't source ~/.bashrc, so an env var exported there never reaches them.
+    A project-local .env sidesteps that entirely.
+    """
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        return token
+    env_file = ROOT / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("HF_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
 
 
 def slugify(text, limit=60):
@@ -95,17 +144,28 @@ def transcribe(audio_path, diarize=False):
 
     if diarize:
         print("  diarizing (this is the slow part) ...", flush=True)
-        import os
-        token = os.environ.get("HF_TOKEN")
+        token = hf_token()
         if not token:
-            print("  ! HF_TOKEN unset - skipping diarization", file=sys.stderr)
+            print("  ! HF_TOKEN not set (env or .env) - skipping diarization", file=sys.stderr)
         else:
             try:
                 from whisperx.diarize import DiarizationPipeline
             except ImportError:
                 from whisperx import DiarizationPipeline
-            dia = DiarizationPipeline(use_auth_token=token, device=device)
+            try:
+                dia = DiarizationPipeline(token=token, device=device)
+            except TypeError:
+                # older whisperx/pyannote versions name the arg use_auth_token
+                dia = DiarizationPipeline(use_auth_token=token, device=device)
             result = whisperx.assign_word_speakers(dia(audio), result)
+            del dia
+
+    # Whisper/align/diarization models stay resident on the GPU otherwise, and
+    # compete with Ollama for VRAM during the structuring pass right after -
+    # that's a real CUDA OOM Ollama has hit here before, not hypothetical.
+    del model, align_model
+    import torch
+    torch.cuda.empty_cache()
 
     return {"segments": result["segments"], "language": lang, "duration": duration}
 
@@ -143,7 +203,7 @@ def transcript_markdown(asr, para_chars=None):
 
 # --------------------------------------------------------------------------- LLM
 
-def ollama(prompt, system=None):
+def ollama(prompt, system=None, retries=2):
     cfg = CFG["llm"]
     msgs = ([{"role": "system", "content": system}] if system else [])
     msgs.append({"role": "user", "content": prompt})
@@ -151,13 +211,28 @@ def ollama(prompt, system=None):
         "model": cfg["model"], "messages": msgs, "stream": False,
         "think": cfg.get("think", False),
         "options": {"temperature": cfg["temperature"]},
+        # Ollama's default 5min keep-alive holds this model on the GPU after
+        # the response returns, which starves the NEXT file's whisper load
+        # of VRAM (that's what just crashed) - evict it immediately instead.
+        "keep_alive": 0,
     }).encode()
     req = urllib.request.Request(
         f"{cfg['host']}/api/chat", data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=1800) as r:
-        return json.load(r)["message"]["content"].strip()
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=1800) as r:
+                return json.load(r)["message"]["content"].strip()
+        except urllib.error.HTTPError as e:
+            # Ollama returns 500 while it's mid-recovery from a model-load
+            # OOM (auto-retries internally with CPU offload) - a short wait
+            # rides through that window instead of failing the whole file.
+            if e.code != 500 or attempt == retries:
+                raise
+            print(f"  ! ollama HTTP 500, retrying in 15s ({attempt + 1}/{retries}) ...",
+                  file=sys.stderr)
+            time.sleep(15)
 
 
 SYSTEM = (
@@ -270,44 +345,61 @@ def structure(transcript):
 def process(audio_path, use_llm=True, diarize=False, force=False):
     audio_path = Path(audio_path)
     print(f"\n=> {audio_path.name}")
-    asr = transcribe(audio_path, diarize=diarize)
-    body = transcript_markdown(asr)
 
     stamp = dt.datetime.fromtimestamp(audio_path.stat().st_mtime)
     date = stamp.strftime("%Y-%m-%d")
-    title = f"{date} {audio_path.stem}"
+    # Strip a date prefix the filename may already carry (e.g. reprocessing
+    # something out of Converted/ or Audio-Archive/) so titles don't stack
+    # dates: "2026-08-15-2026-08-15-foo" instead of "2026-08-15-foo".
+    stem = DATE_PREFIX_RE.sub("", audio_path.stem)
+    title = f"{date} {stem}"
     slug = slugify(title)
 
     for d in (INBOX, TRANSCRIPTS, ARCHIVE):
         d.mkdir(parents=True, exist_ok=True)
 
-    tpath = require_fresh(TRANSCRIPTS / f"{slug}-transcript.md", force)
-    tpath.write_text(
-        f"---\ntitle: {yaml_scalar(title + ' (transcript)')}\ndate: {yaml_scalar(date)}\n"
-        f"duration: {yaml_scalar(hhmmss(asr['duration']))}\n"
-        f"language: {yaml_scalar(asr['language'])}\n"
-        f"source: plaud\ntype: transcript\n---\n\n{body}\n"
-    )
-    print(f"  transcript -> {tpath.relative_to(VAULT)}")
+    # transcribe() and structure() (below) both load models onto the GPU -
+    # hold the lock across the whole span so a second, overlapping run of
+    # this script queues instead of racing for VRAM.
+    with gpu_lock():
+        asr = transcribe(audio_path, diarize=diarize)
+        body = transcript_markdown(asr)
 
-    if use_llm:
-        print("  structuring via ollama ...", flush=True)
-        note = structure(body)
-        npath = require_fresh(INBOX / f"{slug}.md", force)
-        npath.write_text(
-            f"---\ntitle: {yaml_scalar(title)}\ndate: {yaml_scalar(date)}\n"
-            f"duration: {yaml_scalar(hhmmss(asr['duration']))}\nsource: plaud\n"
-            f"type: recording-note\nstatus: unreviewed\n"
-            f"transcript: {yaml_scalar('[[' + tpath.stem + ']]')}\n---\n\n"
-            f"# {title}\n\n{note}\n\n---\nFull transcript: [[{tpath.stem}]]\n"
+        tpath = require_fresh(TRANSCRIPTS / f"{slug}-transcript.md", force)
+        tpath.write_text(
+            f"---\ntitle: {yaml_scalar(title + ' (transcript)')}\ndate: {yaml_scalar(date)}\n"
+            f"duration: {yaml_scalar(hhmmss(asr['duration']))}\n"
+            f"language: {yaml_scalar(asr['language'])}\n"
+            f"source: plaud\ntype: transcript\n---\n\n{body}\n"
         )
-        print(f"  note       -> {npath.relative_to(VAULT)}")
+        print(f"  transcript -> {tpath.relative_to(VAULT)}")
+
+        if use_llm:
+            print("  structuring via ollama ...", flush=True)
+            note = structure(body)
+            npath = require_fresh(INBOX / f"{slug}.md", force)
+            npath.write_text(
+                f"---\ntitle: {yaml_scalar(title)}\ndate: {yaml_scalar(date)}\n"
+                f"duration: {yaml_scalar(hhmmss(asr['duration']))}\nsource: plaud\n"
+                f"type: recording-note\nstatus: unreviewed\n"
+                f"transcript: {yaml_scalar('[[' + tpath.stem + ']]')}\n---\n\n"
+                f"# {title}\n\n{note}\n\n---\nFull transcript: [[{tpath.stem}]]\n"
+            )
+            print(f"  note       -> {npath.relative_to(VAULT)}")
 
     # Date-prefix archive names so same basenames from different folders don't collide.
     dest = unique_path(ARCHIVE / f"{date}-{audio_path.name}")
     if audio_path.resolve() != dest.resolve():
         shutil.copy2(audio_path, dest)
         print(f"  audio      -> {dest.relative_to(VAULT)}")
+
+    return {
+        "slug": slug,
+        "date": date,
+        "transcript": tpath,
+        "note": npath if use_llm else None,
+        "archive": dest,
+    }
 
 
 def main():

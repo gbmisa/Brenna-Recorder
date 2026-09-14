@@ -5,7 +5,7 @@ Recorder audio → diarized transcript → structured Obsidian note, fully local
 Lives at `~/AI projects/Brenna Recorder/`. Both path components contain spaces, so
 quote them in the shell.
 
-The Obsidian vault is deliberately NOT here — it stays at `~/Obsidian/Karpathy-Wiki/`.
+The Obsidian vault is deliberately NOT here — it stays at `~/Obsidian/Brenna-Recorder/`.
 
 ## Run it
 
@@ -26,9 +26,25 @@ cd ~/"AI projects/Brenna Recorder"
 HF_TOKEN=hf_xxx .venv/bin/python pipeline.py --diarize recording.wav
 ```
 
+## Watch folder
+
+```bash
+.venv/bin/python watch.py                # leave running; diarize per config.toml
+.venv/bin/python watch.py --diarize
+.venv/bin/python watch.py --no-llm
+```
+
+Drop mp3/wav/m4a/flac/ogg files into `Inbox/`. Once a file's size stops changing
+(so a still-copying file isn't grabbed mid-write), it's run through the same
+pipeline as a normal `pipeline.py` call. On success the source file moves into
+`Converted/`, renamed to match the note/transcript slug. On failure it moves into
+`Failed/` instead, so a broken file doesn't get retried every poll forever.
+`Inbox/`, `Converted/`, and `Failed/` are local to this project (gitignored), not
+in the Obsidian vault.
+
 ## Output
 
-Everything lands in `~/Obsidian/Karpathy-Wiki/`:
+Everything lands in `~/Obsidian/Brenna-Recorder/`:
 
 | Path | Contents |
 |---|---|

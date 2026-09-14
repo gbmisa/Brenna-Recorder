@@ -7,8 +7,18 @@
 __pycache__/
 *.py[cod]
 
+# secrets
+.env
+
 # Audio and transcripts live in the Obsidian vault, never here
 *.wav
 *.mp3
 *.m4a
 *.flac
+
+# watch.py drop folders - contents are transient, never committed
+/Inbox/*
+!/Inbox/process-inbox.sh
+/Converted/
+/Failed/
+.pipeline.lock
